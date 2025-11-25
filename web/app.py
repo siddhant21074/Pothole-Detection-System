@@ -52,26 +52,58 @@ frame_lock = Lock()
 
 def save_pothole_to_firebase(lat: float, lon: float, confidence: float, timestamp: str):
     """Save pothole detection to Firebase Realtime Database"""
+    print(f"\n=== Attempting to save to Firebase ===")
+    print(f"Location: {lat}, {lon}")
+    print(f"Confidence: {confidence}")
+    print(f"Timestamp: {timestamp}")
+    
     if not firebase_initialized:
-        print("Firebase not initialized, skipping save to database")
+        print("✗ Firebase not initialized, skipping save to database")
         return False
     
     try:
-        ref = db.reference('potholes')
-        new_pothole_ref = ref.push()
-        new_pothole_ref.set({
-            'location': {
-                'lat': lat,
-                'lon': lon
-            },
-            'confidence': confidence,
+        # Get a reference to the 'coordinates' node
+        ref = db.reference('coordinates')
+        print("✓ Connected to Firebase 'coordinates' node")
+        
+        # Get the next available ID (find max ID and increment)
+        all_coords = ref.get() or {}
+        print(f"Found {len(all_coords)} existing coordinates")
+        
+        # Handle case where there are no coordinates yet
+        if not all_coords:
+            max_id = 100  # Start from 100 if no coordinates exist
+        else:
+            try:
+                # Get all numeric keys and find max
+                numeric_keys = [int(k) for k in all_coords.keys() if k.isdigit()]
+                max_id = max(numeric_keys) + 1 if numeric_keys else 100
+            except Exception as e:
+                print(f"Error finding max ID: {e}")
+                max_id = 100
+        
+        print(f"Using ID: {max_id}")
+        
+        # Prepare data with proper types
+        pothole_data = {
+            'id': str(max_id),
+            'latitude': str(round(lat, 6)),
+            'longitude': str(round(lon, 6)),
             'timestamp': timestamp,
-            'reported_at': {'.sv': 'timestamp'}  # Server timestamp
-        })
-        print(f"✓ Pothole data saved to Firebase (ID: {new_pothole_ref.key})")
+            'confidence': str(round(float(confidence), 2))
+        }
+        
+        print("Saving data:", pothole_data)
+        
+        # Save the data with the numeric ID as the key
+        ref.child(str(max_id)).set(pothole_data)
+        
+        print(f"✓ Pothole data saved to Firebase (ID: {max_id})")
         return True
     except Exception as e:
         print(f"✗ Failed to save pothole to Firebase: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # Global variables
@@ -177,8 +209,17 @@ def gen_frames():
                     
                     # Update potholes with location
                     if detections:
-                        for det in detections:
-                            if det['confidence'] > 0.5:  # Only store high-confidence detections
+                        print(f"\n=== Detected {len(detections)} potholes ===")
+                        for i, det in enumerate(detections, 1):
+                            confidence = float(det.get('confidence', 0))
+                            timestamp = det.get('timestamp', datetime.now().isoformat())
+                            
+                            print(f"\nPothole {i}:")
+                            print(f"- Confidence: {confidence}")
+                            print(f"- Timestamp: {timestamp}")
+                            print(f"- Current Location: {current_location}")
+                            
+                            if confidence > 0.25:  # Lowered threshold to capture more detections
                                 pothole_feature = {
                                     'type': 'Feature',
                                     'geometry': {
@@ -186,8 +227,8 @@ def gen_frames():
                                         'coordinates': [current_location['lon'], current_location['lat']]
                                     },
                                     'properties': {
-                                        'confidence': det['confidence'],
-                                        'timestamp': det['timestamp']
+                                        'confidence': confidence,
+                                        'timestamp': timestamp
                                     }
                                 }
                                 
@@ -196,13 +237,15 @@ def gen_frames():
                                 if len(potholes['features']) > 100:
                                     potholes['features'] = potholes['features'][-100:]
                                 
-                                # Save to Firebase
+                                print(f"Saving pothole {i} to Firebase...")
                                 save_pothole_to_firebase(
-                                    lat=current_location['lat'],
-                                    lon=current_location['lon'],
-                                    confidence=det['confidence'],
-                                    timestamp=det['timestamp']
+                                    lat=float(current_location['lat']),
+                                    lon=float(current_location['lon']),
+                                    confidence=confidence,
+                                    timestamp=timestamp
                                 )
+                            else:
+                                print(f"Skipping low confidence detection: {confidence}")
                     
                     with frame_lock:
                         latest_frame = processed_frame.copy()

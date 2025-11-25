@@ -1,0 +1,17 @@
+pandas 
+numpy 
+seaborn
+matplotlib
+scikit-learn
+dill
+flask
+ultralytics>=8.0.0
+opencv-python>=4.5.0
+gpxpy>=1.4.0
+geopy>=2.2.0
+folium>=0.12.0
+gpsd-py3>=0.3.0
+python-dotenv>=0.19.0
+tqdm
+torch
+firebase-admin>=6.2.0

@@ -1,0 +1,7 @@
+path: data\raw\PUBLIC POTHOLE DATASET
+train: train/images
+val: val/images
+test: test/images
+names:
+  0: pothole
+nc: 1

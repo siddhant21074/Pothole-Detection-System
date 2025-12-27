@@ -4,14 +4,17 @@ import sys
 import cv2
 import time
 import json
+import torch
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, db
 from firebase_admin.db import Reference
-from typing import Dict, Any, Optional
-import json
+from typing import Dict, Any, Optional, Tuple, List
 from flask import Flask, render_template_string, Response, request, jsonify
 from threading import Lock
+from pathlib import Path
+from ultralytics import YOLO
+import numpy as np
 
 # Add the project root to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -19,7 +22,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Now import your module
-from src.detection.optimized_detector import OptimizedPotholeDetector
+from src.detection.yolov8_pretrained_detector import YOLOv8PotholeDetector
 
 app = Flask(__name__)
 
@@ -114,14 +117,29 @@ potholes = {'type': 'FeatureCollection', 'features': []}
 latest_frame = None
 
 def init_detector():
-    """Initialize the detector"""
+    """Initialize the custom YOLOv8 detector"""
     global detector
     try:
-        detector = OptimizedPotholeDetector(conf_threshold=0.25)
-        print("✓ Detector initialized successfully")
+        # Path to custom model
+        model_path = os.path.join(project_root, 'models', 'optimized', 'yolov8s_pothole_optimized', 'weights', 'best.pt')
+        
+        if not os.path.exists(model_path):
+            print(f"✗ Custom model not found at {model_path}")
+            return False
+            
+        # Initialize YOLO model with custom weights
+        detector = YOLO(model_path)
+        detector.to('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Set model parameters
+        detector.overrides['conf'] = 0.4  # Confidence threshold
+        detector.overrides['iou'] = 0.45  # NMS IoU threshold
+        detector.overrides['agnostic_nms'] = True
+        
+        print("✓ Custom YOLOv8 Detector initialized successfully")
         return True
     except Exception as e:
-        print(f"✗ Detector initialization failed: {e}")
+        print(f"✗ Failed to initialize custom YOLOv8 detector: {e}")
         detector = None
         return False
 
@@ -170,6 +188,48 @@ def init_camera():
     camera = None
     return False
 
+def process_detection(frame, model, conf_threshold: float = 0.4) -> Tuple[List[Dict], np.ndarray]:
+    """Process frame with YOLOv8 model and return detections and annotated frame"""
+    # Make a copy of the frame for drawing
+    annotated_frame = frame.copy()
+    detections = []
+    
+    # Run inference
+    results = model(frame, verbose=False)
+    
+    # Process results
+    for result in results:
+        boxes = result.boxes.xyxy.cpu().numpy()  # Get bounding boxes in (x1, y1, x2, y2) format
+        confidences = result.boxes.conf.cpu().numpy()  # Get confidence scores
+        class_ids = result.boxes.cls.cpu().numpy()  # Get class IDs
+        
+        for box, conf, class_id in zip(boxes, confidences, class_ids):
+            # Only process pothole class (class_id 0)
+            if class_id != 0 or conf < conf_threshold:
+                continue
+                
+            x1, y1, x2, y2 = map(int, box[:4])
+            
+            # Add to detections
+            detections.append({
+                'bbox': [x1, y1, x2, y2],
+                'confidence': float(conf),
+                'class_id': int(class_id),
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            # Draw bounding box
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Draw label with confidence
+            label = f"Pothole: {conf:.2f}"
+            (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(annotated_frame, (x1, y1 - 20), (x1 + label_width, y1), (0, 255, 0), -1)
+            cv2.putText(annotated_frame, label, (x1, y1 - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    
+    return detections, annotated_frame
+
 def gen_frames():
     """Generate frames with pothole detection"""
     global latest_frame, potholes, current_location
@@ -204,23 +264,32 @@ def gen_frames():
             # Run detection at intervals
             if detector and (current_time - last_detection_time) >= detection_interval:
                 try:
-                    detections, processed_frame = detector.detect(frame)
+                    detections, processed_frame = process_detection(frame, detector)
                     last_detection_time = current_time
                     
                     # Update potholes with location
                     if detections:
                         print(f"\n=== Detected {len(detections)} potholes ===")
                         for i, det in enumerate(detections, 1):
-                            confidence = float(det.get('confidence', 0))
-                            timestamp = det.get('timestamp', datetime.now().isoformat())
+                            confidence = det['confidence']
+                            timestamp = det['timestamp']
                             
                             print(f"\nPothole {i}:")
                             print(f"- Confidence: {confidence}")
                             print(f"- Timestamp: {timestamp}")
                             print(f"- Current Location: {current_location}")
                             
-                            if confidence > 0.25:  # Lowered threshold to capture more detections
-                                pothole_feature = {
+                            # Save to Firebase if confidence is high enough
+                            if confidence >= 0.5:  # Only save high confidence detections
+                                save_pothole_to_firebase(
+                                    lat=current_location['lat'],
+                                    lon=current_location['lon'],
+                                    confidence=confidence,
+                                    timestamp=timestamp
+                                )
+                                
+                                # Add to potholes list for mapping
+                                potholes['features'].append({
                                     'type': 'Feature',
                                     'geometry': {
                                         'type': 'Point',
@@ -230,41 +299,25 @@ def gen_frames():
                                         'confidence': confidence,
                                         'timestamp': timestamp
                                     }
-                                }
-                                
-                                # Keep only last 100 potholes in memory
-                                potholes['features'].append(pothole_feature)
-                                if len(potholes['features']) > 100:
-                                    potholes['features'] = potholes['features'][-100:]
-                                
-                                print(f"Saving pothole {i} to Firebase...")
-                                save_pothole_to_firebase(
-                                    lat=float(current_location['lat']),
-                                    lon=float(current_location['lon']),
-                                    confidence=confidence,
-                                    timestamp=timestamp
-                                )
-                            else:
-                                print(f"Skipping low confidence detection: {confidence}")
+                                })
                     
-                    with frame_lock:
-                        latest_frame = processed_frame.copy()
-                    frame = processed_frame
+                    # Update the latest frame with detections
+                    latest_frame = processed_frame
                     
                 except Exception as e:
-                    print(f"Detection error: {e}")
+                    print(f"Error during detection: {e}")
+                    processed_frame = frame
             else:
-                # Just display the frame without detection
-                with frame_lock:
-                    if latest_frame is not None:
-                        frame = latest_frame.copy()
-            
-            # Add info overlay
-            cv2.putText(frame, f"Frame: {frame_count}", (10, frame.shape[0] - 10),
+                # Use the last processed frame if not time for new detection yet
+                processed_frame = latest_frame if latest_frame is not None else frame
+                
+            # Add info overlay to the processed frame
+            cv2.putText(processed_frame, f"Frame: {frame_count}", 
+                       (10, processed_frame.shape[0] - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
-            # Encode frame
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            # Encode the processed frame
+            ret, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ret:
                 continue
             

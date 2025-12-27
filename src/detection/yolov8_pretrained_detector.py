@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import torch
@@ -8,42 +9,42 @@ from typing import List, Dict, Tuple
 logger = logging.getLogger(__name__)
 
 class YOLOv8PotholeDetector:
-    def __init__(self, model_size: str = 'm', conf_threshold: float = 0.35, iou_threshold: float = 0.45):
+    def __init__(self, model_size: str = 'n', conf_threshold: float = 0.4, iou_threshold: float = 0.5):
         """
-        Initialize the YOLOv8 pre-trained pothole detector.
-        
+        Initialize the YOLOv8 pothole detector with the trained model.
+
         Args:
-            model_size: Size of YOLOv8 model (n, s, m, l, x). Larger models are more accurate but slower.
+            model_size: Size of YOLOv8 model (n, s, m, l, x). Only used if optimizer.pt is not found.
             conf_threshold: Confidence threshold for detections (0-1)
             iou_threshold: IoU threshold for NMS (0-1)
         """
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model_size = model_size
+        self.model = None
         
         # Initialize the model
         self._initialize_model()
-    
+
     def _initialize_model(self):
-        """Load the pre-trained YOLOv8 model"""
+        """Load the trained model from optimizer.pt"""
         try:
-            # Load pre-trained model (will download if not found)
-            model_name = f'yolov8{self.model_size}.pt'
-            self.model = YOLO(model_name)
+            # Path to the optimizer.pt in the root directory
+            model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'optimizer.pt')
             
-            # Move model to GPU if available
+            if os.path.exists(model_path):
+                self.model = YOLO(model_path)
+                logger.info(f"✓ Loaded trained model from {model_path}")
+                logger.info(f"Using device: {self.device}")
+            else:
+                raise FileNotFoundError(f"Trained model not found at {model_path}")
+            
+            # Set model to evaluation mode
             self.model.to(self.device)
-            
-            # Set model parameters
-            self.model.overrides['conf'] = self.conf_threshold
-            self.model.overrides['iou'] = self.iou_threshold
-            self.model.overrides['agnostic_nms'] = True  # Class-agnostic NMS
-            
-            logger.info(f"Loaded YOLOv8-{self.model_size.upper()} model on {self.device.upper()}")
+            self.model.eval()
             
         except Exception as e:
-            logger.error(f"Failed to initialize YOLOv8 model: {e}")
+            logger.error(f"Error loading model: {str(e)}")
             raise
     
     def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -126,7 +127,7 @@ if __name__ == "__main__":
     import cv2
     
     # Initialize detector
-    detector = YOLOv8PotholeDetector(model_size='m')
+    detector = YOLOv8PotholeDetector()
     
     # Open webcam
     cap = cv2.VideoCapture(0)

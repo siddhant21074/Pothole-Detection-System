@@ -144,99 +144,130 @@ def init_detector():
         return False
 
 def init_camera():
-    """Initialize the default camera with multiple fallback options"""
+    """Initialize the external camera with V4L2 backend"""
     global camera
     
-    # Try different camera backends and indices
-    backends = [
-        (cv2.CAP_DSHOW, "DirectShow"),
-        (cv2.CAP_MSMF, "Media Foundation"),
-        (cv2.CAP_ANY, "Auto"),
-    ]
+    # Try different camera indices to find the external camera
+    camera_indices = [0, 1, 2, 3]  # Common indices for external cameras
     
-    camera_indices = [0, 1, 2]
-    
-    for backend, backend_name in backends:
-        for idx in camera_indices:
+    for idx in camera_indices:
+        try:
+            print(f"Trying camera index {idx}...")
+            
+            # Try V4L2 backend first (for Linux/Raspberry Pi)
             try:
-                print(f"Trying camera {idx} with {backend_name}...")
-                cam = cv2.VideoCapture(idx, backend)
-                
-                if cam.isOpened():
-                    # Configure camera
-                    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    cam.set(cv2.CAP_PROP_FPS, 30)
-                    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                camera = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                if not camera.isOpened():
+                    camera = cv2.VideoCapture(idx)  # Fallback to default backend
+            except:
+                camera = cv2.VideoCapture(idx)  # Fallback to default backend
+            
+            if camera.isOpened():
+                # Test if we can actually read a frame
+                ret, frame = camera.read()
+                if ret and frame is not None:
+                    # Configure camera settings
+                    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    camera.set(cv2.CAP_PROP_FPS, 20)
+                    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     
-                    # Test read
-                    ret, frame = cam.read()
-                    if ret and frame is not None:
-                        camera = cam
-                        print(f"✓ Camera {idx} initialized with {backend_name}")
-                        print(f"  Resolution: {int(cam.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-                        print(f"  FPS: {int(cam.get(cv2.CAP_PROP_FPS))}")
-                        return True
-                    else:
-                        cam.release()
-                        
-            except Exception as e:
-                print(f"✗ Failed to open camera {idx} with {backend_name}: {e}")
-                continue
+                    print(f"✓ External camera found at index {idx}")
+                    print(f"  Resolution: {int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+                    print(f"  FPS: {int(camera.get(cv2.CAP_PROP_FPS))}")
+                    return True
+                else:
+                    camera.release()
+                    camera = None
+        except Exception as e:
+            print(f"Error initializing camera {idx}: {e}")
+            if camera is not None:
+                camera.release()
+                camera = None
     
-    print("✗ No camera found!")
-    camera = None
+    print("✗ No external camera found or could not be opened")
     return False
 
 def process_detection(frame, model, conf_threshold: float = 0.4) -> Tuple[List[Dict], np.ndarray]:
     """Process frame with YOLOv8 model and return detections and annotated frame"""
-    # Make a copy of the frame for drawing
-    annotated_frame = frame.copy()
-    detections = []
+    if frame is None:
+        return [], np.zeros((480, 640, 3), dtype=np.uint8)
     
-    # Run inference
-    results = model(frame, verbose=False)
-    
-    # Process results
-    for result in results:
-        boxes = result.boxes.xyxy.cpu().numpy()  # Get bounding boxes in (x1, y1, x2, y2) format
-        confidences = result.boxes.conf.cpu().numpy()  # Get confidence scores
-        class_ids = result.boxes.cls.cpu().numpy()  # Get class IDs
+    try:
+        # Preprocess frame
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        for box, conf, class_id in zip(boxes, confidences, class_ids):
-            # Only process pothole class (class_id 0)
-            if class_id != 0 or conf < conf_threshold:
-                continue
+        # Run inference with optimized settings
+        results = model.predict(
+            frame_rgb,
+            conf=conf_threshold,
+            iou=0.45,
+            imgsz=640,      # Input size
+            max_det=20,     # Maximum number of detections
+            agnostic_nms=True,  # Class-agnostic NMS
+            verbose=False
+        )
+        
+        detections = []
+        annotated_frame = frame.copy()
+        
+        # Process results
+        for result in results:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            confidences = result.boxes.conf.cpu().numpy()
+            class_ids = result.boxes.cls.cpu().numpy()
+            
+            for box, conf, class_id in zip(boxes, confidences, class_ids):
+                x1, y1, x2, y2 = map(int, box)
                 
-            x1, y1, x2, y2 = map(int, box[:4])
-            
-            # Add to detections
-            detections.append({
-                'bbox': [x1, y1, x2, y2],
-                'confidence': float(conf),
-                'class_id': int(class_id),
-                'timestamp': datetime.now().isoformat()
-            })
-            
-            # Draw bounding box
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # Draw label with confidence
-            label = f"Pothole: {conf:.2f}"
-            (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated_frame, (x1, y1 - 20), (x1 + label_width, y1), (0, 255, 0), -1)
-            cv2.putText(annotated_frame, label, (x1, y1 - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-    
-    return detections, annotated_frame
+                # Only process pothole class (class_id 0)
+                if class_id == 0 and conf >= conf_threshold:
+                    detections.append({
+                        'box': [x1, y1, x2, y2],
+                        'confidence': float(conf),
+                        'class': 'pothole'
+                    })
+                    
+                    # Draw bounding box
+                    color = (0, 255, 0)  # Green
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                    
+                    # Draw label with confidence
+                    label = f"Pothole: {conf:.2f}"
+                    (label_width, label_height), _ = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                    )
+                    cv2.rectangle(
+                        annotated_frame,
+                        (x1, y1 - 20),
+                        (x1 + label_width, y1),
+                        color,
+                        -1
+                    )
+                    cv2.putText(
+                        annotated_frame,
+                        label,
+                        (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 0, 0),
+                        1
+                    )
+        
+        return detections, annotated_frame
+        
+    except Exception as e:
+        print(f"Error in detection: {e}")
+        return [], frame
 
 def gen_frames():
     """Generate frames with pothole detection"""
     global latest_frame, potholes, current_location
     
+    frame_skip = 2  # Process every 2nd frame to improve performance
     frame_count = 0
     last_detection_time = 0
-    detection_interval = 0.1  # Run detection every 100ms
+    detection_interval = 0.3  # Run detection every 300ms
     
     while True:
         if camera is None:
@@ -251,7 +282,10 @@ def gen_frames():
             
         try:
             with camera_lock:
-                success, frame = camera.read()
+                # Skip frames to improve performance
+                for _ in range(frame_skip):
+                    success = camera.grab()
+                success, frame = camera.retrieve()
             
             if not success or frame is None:
                 print("Failed to read frame, reinitializing camera...")
@@ -266,69 +300,38 @@ def gen_frames():
                 try:
                     detections, processed_frame = process_detection(frame, detector)
                     last_detection_time = current_time
-                    
-                    # Update potholes with location
-                    if detections:
-                        print(f"\n=== Detected {len(detections)} potholes ===")
-                        for i, det in enumerate(detections, 1):
-                            confidence = det['confidence']
-                            timestamp = det['timestamp']
-                            
-                            print(f"\nPothole {i}:")
-                            print(f"- Confidence: {confidence}")
-                            print(f"- Timestamp: {timestamp}")
-                            print(f"- Current Location: {current_location}")
-                            
-                            # Save to Firebase if confidence is high enough
-                            if confidence >= 0.5:  # Only save high confidence detections
-                                save_pothole_to_firebase(
-                                    lat=current_location['lat'],
-                                    lon=current_location['lon'],
-                                    confidence=confidence,
-                                    timestamp=timestamp
-                                )
-                                
-                                # Add to potholes list for mapping
-                                potholes['features'].append({
-                                    'type': 'Feature',
-                                    'geometry': {
-                                        'type': 'Point',
-                                        'coordinates': [current_location['lon'], current_location['lat']]
-                                    },
-                                    'properties': {
-                                        'confidence': confidence,
-                                        'timestamp': timestamp
-                                    }
-                                })
-                    
-                    # Update the latest frame with detections
                     latest_frame = processed_frame
+                    
+                    # Update potholes with location if any detections
+                    if detections:
+                        for detection in detections:
+                            if detection['confidence'] >= 0.5:  # Only save high-confidence detections
+                                timestamp = datetime.now().isoformat()
+                                save_pothole_to_firebase(
+                                    current_location['lat'],
+                                    current_location['lon'],
+                                    detection['confidence'],
+                                    timestamp
+                                )
                     
                 except Exception as e:
                     print(f"Error during detection: {e}")
                     processed_frame = frame
             else:
-                # Use the last processed frame if not time for new detection yet
+                # If not detecting, just use the previous frame
                 processed_frame = latest_frame if latest_frame is not None else frame
-                
-            # Add info overlay to the processed frame
-            cv2.putText(processed_frame, f"Frame: {frame_count}", 
-                       (10, processed_frame.shape[0] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
-            # Encode the processed frame
+            # Encode the frame
             ret, buffer = cv2.imencode('.jpg', processed_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ret:
                 continue
-            
+                
+            # Yield the frame
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
             
-            # Small delay for frame rate control
-            time.sleep(0.033)  # ~30 FPS
-            
         except Exception as e:
-            print(f"Frame generation error: {e}")
+            print(f"Error in frame generation: {e}")
             time.sleep(0.1)
 
 def create_placeholder_frame():
